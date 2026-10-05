@@ -1,6 +1,2 @@
-fastapi
-uvicorn[standard]
-python-multipart
+streamlit
 openai
-python-dotenv
-requests
