@@ -6,6 +6,7 @@ import tempfile
 import requests
 import streamlit as st
 from faster_whisper import WhisperModel
+from google import genai
 
 
 # ============================================================
@@ -36,6 +37,11 @@ OLLAMA_URL = os.getenv(
 OLLAMA_MODEL = os.getenv(
     "OLLAMA_MODEL",
     "qwen2.5:3b"
+)
+
+GEMINI_MODEL = os.getenv(
+    "MEETIQ_GEMINI_MODEL",
+    "gemini-2.5-flash"
 )
 
 
@@ -139,6 +145,26 @@ def load_whisper_model():
 
 
 # ============================================================
+# GET GEMINI API KEY
+# ============================================================
+
+def get_gemini_api_key():
+
+    # Streamlit Cloud Secrets
+    try:
+        key = st.secrets.get("GEMINI_API_KEY")
+
+        if key:
+            return key
+
+    except Exception:
+        pass
+
+    # Local environment variable
+    return os.getenv("GEMINI_API_KEY")
+
+
+# ============================================================
 # CHECK OLLAMA
 # ============================================================
 
@@ -187,10 +213,8 @@ def transcribe_meeting(uploaded_file):
 
                 temp_path = temp_file.name
 
-            # Load Faster-Whisper
             model = load_whisper_model()
 
-            # Transcribe
             segments, info = model.transcribe(
                 temp_path,
                 beam_size=5,
@@ -227,7 +251,7 @@ def transcribe_meeting(uploaded_file):
 
 
 # ============================================================
-# BUILD QWEN PROMPT
+# BUILD ANALYSIS PROMPT
 # ============================================================
 
 def build_analysis_prompt(transcript):
@@ -289,10 +313,143 @@ MEETING TRANSCRIPT:
 
 
 # ============================================================
-# ANALYZE MEETING WITH QWEN
+# GEMINI JSON SCHEMA
 # ============================================================
 
-def analyze_meeting(transcript):
+GEMINI_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "summary": {
+            "type": "STRING"
+        },
+
+        "key_topics": {
+            "type": "ARRAY",
+            "items": {
+                "type": "STRING"
+            }
+        },
+
+        "decisions": {
+            "type": "ARRAY",
+            "items": {
+                "type": "STRING"
+            }
+        },
+
+        "action_items": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "task": {
+                        "type": "STRING"
+                    },
+                    "owner": {
+                        "type": "STRING"
+                    },
+                    "deadline": {
+                        "type": "STRING"
+                    }
+                },
+                "required": [
+                    "task",
+                    "owner",
+                    "deadline"
+                ]
+            }
+        },
+
+        "unresolved_issues": {
+            "type": "ARRAY",
+            "items": {
+                "type": "STRING"
+            }
+        }
+    },
+
+    "required": [
+        "summary",
+        "key_topics",
+        "decisions",
+        "action_items",
+        "unresolved_issues"
+    ]
+}
+
+
+# ============================================================
+# ANALYZE WITH GEMINI
+# ============================================================
+
+def analyze_with_gemini(transcript):
+
+    api_key = get_gemini_api_key()
+
+    if not api_key:
+
+        raise RuntimeError(
+            "GEMINI_API_KEY is not configured."
+        )
+
+    prompt = build_analysis_prompt(
+        transcript
+    )
+
+    with st.spinner(
+        "🧠 Analyzing meeting with Gemini..."
+    ):
+
+        client = genai.Client(
+            api_key=api_key
+        )
+
+        response = client.models.generate_content(
+
+            model=GEMINI_MODEL,
+
+            contents=prompt,
+
+            config={
+                "response_mime_type": "application/json",
+                "response_schema": GEMINI_SCHEMA,
+                "temperature": 0.2
+            }
+        )
+
+        content = response.text
+
+        if not content:
+
+            raise RuntimeError(
+                "Gemini returned an empty response."
+            )
+
+        try:
+
+            return json.loads(content)
+
+        except json.JSONDecodeError:
+
+            start = content.find("{")
+            end = content.rfind("}")
+
+            if start == -1 or end == -1:
+
+                raise RuntimeError(
+                    "Gemini returned invalid JSON."
+                )
+
+            return json.loads(
+                content[start:end + 1]
+            )
+
+
+# ============================================================
+# ANALYZE WITH OLLAMA + QWEN
+# ============================================================
+
+def analyze_with_ollama(transcript):
 
     if not check_ollama():
 
@@ -306,7 +463,9 @@ def analyze_meeting(transcript):
         transcript
     )
 
-    with st.spinner("🧠 Analyzing meeting with Qwen..."):
+    with st.spinner(
+        "🧠 Analyzing meeting with Qwen..."
+    ):
 
         response = requests.post(
 
@@ -346,14 +505,9 @@ def analyze_meeting(transcript):
 
         try:
 
-            analysis = json.loads(
-                content
-            )
+            return json.loads(content)
 
         except json.JSONDecodeError:
-
-            # Try to extract JSON if Qwen
-            # accidentally added extra text.
 
             start = content.find("{")
             end = content.rfind("}")
@@ -364,15 +518,38 @@ def analyze_meeting(transcript):
                     "Qwen returned invalid JSON."
                 )
 
-            json_text = content[
-                start:end + 1
-            ]
-
-            analysis = json.loads(
-                json_text
+            return json.loads(
+                content[start:end + 1]
             )
 
-        return analysis
+
+# ============================================================
+# SMART AI ROUTER
+# ============================================================
+
+def analyze_meeting(transcript):
+
+    gemini_key = get_gemini_api_key()
+
+    # --------------------------------------------------------
+    # CLOUD MODE
+    # If Gemini key exists, use Gemini.
+    # --------------------------------------------------------
+
+    if gemini_key:
+
+        return analyze_with_gemini(
+            transcript
+        )
+
+    # --------------------------------------------------------
+    # LOCAL MODE
+    # If no Gemini key exists, use Ollama + Qwen.
+    # --------------------------------------------------------
+
+    return analyze_with_ollama(
+        transcript
+    )
 
 
 # ============================================================
@@ -505,6 +682,11 @@ def display_results(analysis):
     if actions:
 
         for action in actions:
+
+            # Safety check in case the model
+            # returns something unexpected.
+            if not isinstance(action, dict):
+                continue
 
             task = action.get(
                 "task",
@@ -661,14 +843,13 @@ if uploaded_file:
         except requests.exceptions.ConnectionError:
 
             st.error(
-                "❌ Cannot connect to Ollama. "
-                "Please make sure Ollama is running."
+                "❌ Cannot connect to the AI service."
             )
 
         except requests.exceptions.Timeout:
 
             st.error(
-                "❌ Ollama took too long to respond. "
+                "❌ The AI service took too long to respond. "
                 "Please try again."
             )
 
@@ -719,5 +900,5 @@ st.divider()
 
 st.caption(
     "MeetIQ • AI Meeting Intelligence Platform • "
-    "Local AI with Faster-Whisper + Ollama + Qwen"
+    "Faster-Whisper + Ollama/Qwen + Gemini"
 )
