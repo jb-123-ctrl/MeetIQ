@@ -1,2 +1,4 @@
 streamlit
-openai
+faster-whisper
+requests
+av<19
