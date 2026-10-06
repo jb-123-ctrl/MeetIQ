@@ -1,9 +1,11 @@
+import html
 import json
 import os
 import tempfile
 
+import requests
 import streamlit as st
-from openai import OpenAI
+from faster_whisper import WhisperModel
 
 
 # ============================================================
@@ -14,6 +16,26 @@ st.set_page_config(
     page_title="MeetIQ",
     page_icon="🎙️",
     layout="wide"
+)
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+WHISPER_MODEL = os.getenv(
+    "MEETIQ_WHISPER_MODEL",
+    "base"
+)
+
+OLLAMA_URL = os.getenv(
+    "OLLAMA_URL",
+    "http://localhost:11434"
+)
+
+OLLAMA_MODEL = os.getenv(
+    "OLLAMA_MODEL",
+    "qwen2.5:3b"
 )
 
 
@@ -103,104 +125,135 @@ st.markdown(
 
 
 # ============================================================
-# OPENAI CLIENT
+# LOAD WHISPER MODEL
 # ============================================================
 
-def get_client():
+@st.cache_resource
+def load_whisper_model():
 
-    # Streamlit Cloud
+    return WhisperModel(
+        WHISPER_MODEL,
+        device="cpu",
+        compute_type="int8"
+    )
+
+
+# ============================================================
+# CHECK OLLAMA
+# ============================================================
+
+def check_ollama():
+
     try:
-        api_key = st.secrets["OPENAI_API_KEY"]
-    except Exception:
-        api_key = os.getenv("OPENAI_API_KEY")
 
-    if not api_key:
-
-        st.error(
-            "OpenAI API key is missing. "
-            "Add OPENAI_API_KEY to Streamlit Secrets."
+        response = requests.get(
+            f"{OLLAMA_URL}/api/tags",
+            timeout=5
         )
 
-        st.stop()
+        response.raise_for_status()
 
-    return OpenAI(api_key=api_key)
+        return True
+
+    except Exception:
+
+        return False
 
 
 # ============================================================
 # TRANSCRIPTION
 # ============================================================
 
-def transcribe_meeting(client, uploaded_file):
+def transcribe_meeting(uploaded_file):
 
     with st.spinner("🎙️ Transcribing meeting..."):
 
-        # Create temporary file
         suffix = os.path.splitext(
             uploaded_file.name
         )[1]
 
-        with tempfile.NamedTemporaryFile(
-            delete=False,
-            suffix=suffix
-        ) as temp_file:
-
-            temp_file.write(
-                uploaded_file.getvalue()
-            )
-
-            temp_path = temp_file.name
+        temp_path = None
 
         try:
 
-            with open(
-                temp_path,
-                "rb"
-            ) as audio_file:
+            with tempfile.NamedTemporaryFile(
+                delete=False,
+                suffix=suffix
+            ) as temp_file:
 
-                result = client.audio.transcriptions.create(
-                    model="gpt-4o-transcribe",
-                    file=audio_file
+                temp_file.write(
+                    uploaded_file.getvalue()
                 )
 
-            transcript = result.text
+                temp_path = temp_file.name
+
+            # Load Faster-Whisper
+            model = load_whisper_model()
+
+            # Transcribe
+            segments, info = model.transcribe(
+                temp_path,
+                beam_size=5,
+                vad_filter=True
+            )
+
+            transcript_parts = []
+
+            for segment in segments:
+
+                text = segment.text.strip()
+
+                if text:
+
+                    transcript_parts.append(text)
+
+            transcript = " ".join(
+                transcript_parts
+            )
+
+            if not transcript.strip():
+
+                raise RuntimeError(
+                    "No speech could be detected in the recording."
+                )
+
+            return transcript
 
         finally:
 
-            if os.path.exists(temp_path):
+            if temp_path and os.path.exists(temp_path):
+
                 os.remove(temp_path)
 
-    return transcript
-
 
 # ============================================================
-# AI MEETING ANALYSIS
+# BUILD QWEN PROMPT
 # ============================================================
 
-def analyze_meeting(client, transcript):
+def build_analysis_prompt(transcript):
 
-    prompt = f"""
+    return f"""
 You are MeetIQ, an AI Meeting Intelligence system.
 
 Analyze the meeting transcript below.
 
-Extract ONLY information that is actually present.
+IMPORTANT RULES:
 
-Do NOT invent:
-- people
-- decisions
-- deadlines
-- action items
-- topics
+1. Extract ONLY information actually present in the transcript.
+2. Do NOT invent people.
+3. Do NOT invent decisions.
+4. Do NOT invent deadlines.
+5. Do NOT invent action items.
+6. Do NOT invent topics.
+7. If an owner is not mentioned, use an empty string.
+8. If a deadline is not mentioned, use an empty string.
+9. If a category has no information, return an empty array.
+10. Return ONLY valid JSON.
+11. Do not include markdown.
+12. Do not include ```json.
+13. Keep the summary concise but informative.
 
-If an owner or deadline is not mentioned,
-use an empty string.
-
-If a category has no information,
-return an empty array.
-
-Return ONLY valid JSON.
-
-Required format:
+Return exactly this structure:
 
 {{
     "summary": "A concise summary of the meeting",
@@ -234,36 +287,107 @@ MEETING TRANSCRIPT:
 {transcript}
 """
 
-    with st.spinner("🧠 Analyzing meeting..."):
 
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a meeting intelligence "
-                        "assistant. Return only valid JSON."
-                    )
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            response_format={
-                "type": "json_object"
-            },
-            temperature=0.2
+# ============================================================
+# ANALYZE MEETING WITH QWEN
+# ============================================================
+
+def analyze_meeting(transcript):
+
+    if not check_ollama():
+
+        raise RuntimeError(
+            "Ollama is not running. "
+            "Please start Ollama and make sure "
+            "qwen2.5:3b is available."
         )
 
-    content = response.choices[0].message.content
+    prompt = build_analysis_prompt(
+        transcript
+    )
 
-    return json.loads(content)
+    with st.spinner("🧠 Analyzing meeting with Qwen..."):
+
+        response = requests.post(
+
+            f"{OLLAMA_URL}/api/generate",
+
+            json={
+                "model": OLLAMA_MODEL,
+
+                "prompt": prompt,
+
+                "stream": False,
+
+                "format": "json",
+
+                "options": {
+                    "temperature": 0.2
+                }
+            },
+
+            timeout=300
+        )
+
+        response.raise_for_status()
+
+        result = response.json()
+
+        content = result.get(
+            "response",
+            ""
+        )
+
+        if not content:
+
+            raise RuntimeError(
+                "Qwen returned an empty response."
+            )
+
+        try:
+
+            analysis = json.loads(
+                content
+            )
+
+        except json.JSONDecodeError:
+
+            # Try to extract JSON if Qwen
+            # accidentally added extra text.
+
+            start = content.find("{")
+            end = content.rfind("}")
+
+            if start == -1 or end == -1:
+
+                raise RuntimeError(
+                    "Qwen returned invalid JSON."
+                )
+
+            json_text = content[
+                start:end + 1
+            ]
+
+            analysis = json.loads(
+                json_text
+            )
+
+        return analysis
 
 
 # ============================================================
-# DISPLAY SUMMARY
+# CLEAN HTML
+# ============================================================
+
+def clean(value):
+
+    return html.escape(
+        str(value or "")
+    )
+
+
+# ============================================================
+# DISPLAY RESULTS
 # ============================================================
 
 def display_results(analysis):
@@ -285,7 +409,7 @@ def display_results(analysis):
     st.markdown(
         f"""
         <div class="card">
-            {summary}
+            {clean(summary)}
         </div>
         """,
         unsafe_allow_html=True
@@ -313,7 +437,9 @@ def display_results(analysis):
         for topic in topics:
 
             topic_html += (
-                f'<span class="topic">{topic}</span>'
+                f'<span class="topic">'
+                f'{clean(topic)}'
+                f'</span>'
             )
 
         st.markdown(
@@ -323,7 +449,9 @@ def display_results(analysis):
 
     else:
 
-        st.info("No key topics identified.")
+        st.info(
+            "No key topics identified."
+        )
 
 
     # --------------------------------------------------------
@@ -347,7 +475,7 @@ def display_results(analysis):
             st.markdown(
                 f"""
                 <div class="card">
-                    ✓ {decision}
+                    ✓ {clean(decision)}
                 </div>
                 """,
                 unsafe_allow_html=True
@@ -355,7 +483,9 @@ def display_results(analysis):
 
     else:
 
-        st.info("No decisions identified.")
+        st.info(
+            "No decisions identified."
+        )
 
 
     # --------------------------------------------------------
@@ -395,13 +525,16 @@ def display_results(analysis):
                 f"""
                 <div class="action">
 
-                <b>Task:</b> {task}<br><br>
+                <b>Task:</b>
+                {clean(task)}
+                <br><br>
 
                 <b>Owner:</b>
-                {owner if owner else "Not specified"}<br><br>
+                {clean(owner) if owner else "Not specified"}
+                <br><br>
 
                 <b>Deadline:</b>
-                {deadline if deadline else "Not specified"}
+                {clean(deadline) if deadline else "Not specified"}
 
                 </div>
                 """,
@@ -410,7 +543,9 @@ def display_results(analysis):
 
     else:
 
-        st.info("No action items identified.")
+        st.info(
+            "No action items identified."
+        )
 
 
     # --------------------------------------------------------
@@ -434,7 +569,7 @@ def display_results(analysis):
             st.markdown(
                 f"""
                 <div class="issue">
-                    ⚠️ {issue}
+                    ⚠️ {clean(issue)}
                 </div>
                 """,
                 unsafe_allow_html=True
@@ -457,7 +592,9 @@ st.markdown(
 )
 
 uploaded_file = st.file_uploader(
+
     "Upload your meeting recording",
+
     type=[
         "wav",
         "mp3",
@@ -465,7 +602,8 @@ uploaded_file = st.file_uploader(
         "mp4",
         "webm",
         "mpeg",
-        "mpga"
+        "mpga",
+        "ogg"
     ]
 )
 
@@ -489,13 +627,13 @@ if uploaded_file:
         use_container_width=True
     ):
 
-        client = get_client()
-
         try:
 
-            # STEP 1
+            # =================================================
+            # STEP 1: SPEECH → TEXT
+            # =================================================
+
             transcript = transcribe_meeting(
-                client,
                 uploaded_file
             )
 
@@ -504,9 +642,11 @@ if uploaded_file:
             ] = transcript
 
 
-            # STEP 2
+            # =================================================
+            # STEP 2: TEXT → MEETING INTELLIGENCE
+            # =================================================
+
             analysis = analyze_meeting(
-                client,
                 transcript
             )
 
@@ -518,10 +658,24 @@ if uploaded_file:
                 "✅ Meeting analysis completed!"
             )
 
+        except requests.exceptions.ConnectionError:
+
+            st.error(
+                "❌ Cannot connect to Ollama. "
+                "Please make sure Ollama is running."
+            )
+
+        except requests.exceptions.Timeout:
+
+            st.error(
+                "❌ Ollama took too long to respond. "
+                "Please try again."
+            )
+
         except Exception as error:
 
             st.error(
-                f"Error while processing meeting: {error}"
+                f"❌ Error while processing meeting: {error}"
             )
 
 
@@ -564,5 +718,6 @@ if "transcript" in st.session_state:
 st.divider()
 
 st.caption(
-    "MeetIQ • AI Meeting Intelligence Platform"
+    "MeetIQ • AI Meeting Intelligence Platform • "
+    "Local AI with Faster-Whisper + Ollama + Qwen"
 )
