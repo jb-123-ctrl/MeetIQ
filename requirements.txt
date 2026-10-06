@@ -2,3 +2,4 @@ streamlit
 faster-whisper
 requests
 av<19
+google-genai
