@@ -2,6 +2,7 @@ import html
 import json
 import os
 import tempfile
+import time
 
 import requests
 import streamlit as st
@@ -387,7 +388,6 @@ def analyze_with_gemini(transcript):
     api_key = get_gemini_api_key()
 
     if not api_key:
-
         raise RuntimeError(
             "GEMINI_API_KEY is not configured."
         )
@@ -404,45 +404,80 @@ def analyze_with_gemini(transcript):
             api_key=api_key
         )
 
-        response = client.models.generate_content(
+        max_attempts = 3
 
-            model=GEMINI_MODEL,
+        for attempt in range(max_attempts):
 
-            contents=prompt,
+            try:
 
-            config={
-                "response_mime_type": "application/json",
-                "response_schema": GEMINI_SCHEMA,
-                "temperature": 0.2
-            }
-        )
+                response = client.models.generate_content(
 
-        content = response.text
+                    model=GEMINI_MODEL,
 
-        if not content:
+                    contents=prompt,
 
-            raise RuntimeError(
-                "Gemini returned an empty response."
-            )
-
-        try:
-
-            return json.loads(content)
-
-        except json.JSONDecodeError:
-
-            start = content.find("{")
-            end = content.rfind("}")
-
-            if start == -1 or end == -1:
-
-                raise RuntimeError(
-                    "Gemini returned invalid JSON."
+                    config={
+                        "response_mime_type": "application/json",
+                        "response_schema": GEMINI_SCHEMA
+                    }
                 )
 
-            return json.loads(
-                content[start:end + 1]
-            )
+                content = response.text
+
+                if not content:
+
+                    raise RuntimeError(
+                        "Gemini returned an empty response."
+                    )
+
+                try:
+
+                    return json.loads(content)
+
+                except json.JSONDecodeError:
+
+                    start = content.find("{")
+                    end = content.rfind("}")
+
+                    if start == -1 or end == -1:
+
+                        raise RuntimeError(
+                            "Gemini returned invalid JSON."
+                        )
+
+                    return json.loads(
+                        content[start:end + 1]
+                    )
+
+            except Exception as error:
+
+                error_text = str(error)
+
+                if "503" in error_text or "UNAVAILABLE" in error_text:
+
+                    if attempt < max_attempts - 1:
+
+                        wait_time = 2 ** attempt
+
+                        st.warning(
+                            f"Gemini is temporarily busy. "
+                            f"Retrying in {wait_time} seconds..."
+                        )
+
+                        time.sleep(
+                            wait_time
+                        )
+
+                    else:
+
+                        raise RuntimeError(
+                            "Gemini is temporarily unavailable. "
+                            "Please try again in a few minutes."
+                        )
+
+                else:
+
+                    raise
 
 
 # ============================================================
